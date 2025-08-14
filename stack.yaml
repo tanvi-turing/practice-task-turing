@@ -1,0 +1,866 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Production-grade reference stack for us-east-1:
+  - VPC with public/private subnets, IGW, NAT
+  - ALB -> ASG (EC2 in private subnets, EBS encrypted via AWS KMS-managed keys)
+  - S3 (versioning, default encryption, lifecycle to Glacier after 30 days)
+  - CloudFront with Origin Access Control (OAC) over S3
+  - RDS (Multi-AZ, encrypted, CloudWatch logs exports)
+  - IAM least-privilege roles
+  - CloudTrail (multi-region) -> S3 + CloudWatch Logs
+  - Route53 hosted zone + CNAME failover (Primary=CloudFront, Secondary=S3 website)
+  - VPC Peering to an existing VPC with routing on this side
+  All resources tagged Project: Migration.
+
+Metadata:
+  Project: Migration
+  Guidance:
+    - Deploy this stack in us-east-1.
+    - After create, add return routes in the peer VPC for VPC peering.
+
+Parameters:
+  ProjectTagValue:
+    Type: String
+    Default: Migration
+    Description: Tag value for Project
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR for the new VPC
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.0.0/20
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.16.0/20
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.128.0/20
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.144.0/20
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedPattern: '^[a-z0-9]+\.[a-z0-9]+$'
+    Description: EC2 instance type for the ASG
+  AsgDesiredCapacity:
+    Type: Number
+    Default: 3
+    MinValue: 2
+    MaxValue: 6
+  AsgMinSize:
+    Type: Number
+    Default: 2
+  AsgMaxSize:
+    Type: Number
+    Default: 6
+
+  ExistingVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC ID to peer with
+  ExistingVpcCidr:
+    Type: String
+    Description: CIDR of the existing VPC (for route tables)
+
+  DBEngine:
+    Type: String
+    Default: postgresql
+    AllowedValues: [postgresql, mysql]
+    Description: RDS engine type
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+  DBName:
+    Type: String
+    Default: appdb
+  DBMasterUsername:
+    Type: String
+    Default: dbadmin
+  DBMasterPassword:
+    NoEcho: true
+    Type: String
+    MinLength: 12
+    Description: Master password (NoEcho)
+
+  HostedZoneName:
+    Type: String
+    Default: example.com.
+    Description: Public hosted zone name (must end with a dot)
+  AppSubdomain:
+    Type: String
+    Default: app
+    Description: Subdomain, e.g., 'app' -> app.example.com
+  CertificateDomainName:
+    Type: String
+    Default: app.example.com
+    Description: Domain name for ACM cert and CloudFront alias (must be within HostedZoneName)
+  CloudFrontPriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+  CloudFrontHealthCheckPath:
+    Type: String
+    Default: /index.html
+    Description: Path used by Route53 health check against CloudFront
+
+  AlbHealthCheckPath:
+    Type: String
+    Default: /
+    Description: Path for ALB TargetGroup health check
+
+Conditions:
+  IsPostgres: !Equals [!Ref DBEngine, postgresql]
+  IsMySQL: !Equals [!Ref DBEngine, mysql]
+
+Mappings: {}
+
+Resources:
+
+  ############################
+  # Networking: VPC & Subnets
+  ############################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-vpc' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-igw' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '' ]
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public-a' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '' ]
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public-b' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '' ]
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-a' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '' ]
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-b' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  PublicRtDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRt
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn: AttachIgw
+
+  AssocPublicA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRt
+      SubnetId: !Ref PublicSubnet1
+
+  AssocPublicB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRt
+      SubnetId: !Ref PublicSubnet2
+
+  EipNatA:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  EipNatB:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  NatGwA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EipNatA.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-nat-a' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  NatGwB:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EipNatB.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-nat-b' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  PrivateRtA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-a' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  PrivateRtB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-b' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  PrivateRtA_Default:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRtA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGwA
+
+  PrivateRtB_Default:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRtB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGwB
+
+  AssocPrivateA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRtA
+      SubnetId: !Ref PrivateSubnet1
+
+  AssocPrivateB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRtB
+      SubnetId: !Ref PrivateSubnet2
+
+  # VPC Peering (this VPC -> Existing VPC). Add return routes on the other side manually.
+  VpcPeering:
+    Type: AWS::EC2::VPCPeeringConnection
+    Properties:
+      VpcId: !Ref VPC
+      PeerVpcId: !Ref ExistingVpcId
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-peering' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  PrivateRtA_PeerRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRtA
+      DestinationCidrBlock: !Ref ExistingVpcCidr
+      VpcPeeringConnectionId: !Ref VpcPeering
+
+  PrivateRtB_PeerRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRtB
+      DestinationCidrBlock: !Ref ExistingVpcCidr
+      VpcPeeringConnectionId: !Ref VpcPeering
+
+  ############################
+  # IAM for EC2 + CloudTrail
+  ############################
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ec2-logs-and-s3-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${AppBucket.Arn}/*'
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [ !Ref InstanceRole ]
+
+  CloudTrailLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cloudtrail-to-cwlogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              # Restrict to the CloudTrail log group we create
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  ############################
+  # Security Groups
+  ############################
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB SG (80/443 from Internet)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-alb-sg' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App instances (receive from ALB, egress anywhere)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-app-sg' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DB SG (ingress from app only)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !If [ IsPostgres, 5432, 3306 ]
+          ToPort: !If [ IsPostgres, 5432, 3306 ]
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-db-sg' }
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  ############################
+  # S3 (App bucket) + Logging
+  ############################
+  AppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-app-${AWS::AccountId}'
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacierAfter30Days
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 30
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  # Bucket for CloudTrail and ALB access logs
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-logs-${AWS::AccountId}'
+      VersioningConfiguration: { Status: Enabled }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerPreferred }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow CloudTrail to write
+          - Sid: AllowCloudTrailWrite
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub '${LogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+          # Allow ALB access logs delivery
+          - Sid: AllowALBLogsWrite
+            Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::127311923021:root   # us-east-1 ALB log delivery account
+            Action:
+              - s3:PutObject
+            Resource: !Sub '${LogsBucket.Arn}/alb/AWSLogs/${AWS::AccountId}/*'
+
+  ############################
+  # CloudFront (OAC) over S3
+  ############################
+  AppOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Description: Access control for S3 origin
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  AppCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref CertificateDomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref CertificateDomainName
+          HostedZoneId: !Ref HostedZone
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${AWS::StackName} CloudFront for ${CertificateDomainName}'
+        Enabled: true
+        PriceClass: !Ref CloudFrontPriceClass
+        Aliases: [ !Ref CertificateDomainName ]
+        DefaultRootObject: index.html
+        Origins:
+          - Id: s3-app
+            DomainName: !GetAtt AppBucket.RegionalDomainName
+            S3OriginConfig: {}  # required syntactically; OAC actually governs access
+            OriginAccessControlId: !GetAtt AppOAC.Id
+        DefaultCacheBehavior:
+          TargetOriginId: s3-app
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # CachingOptimized
+        ViewerCertificate:
+          AcmCertificateArn: !Ref AppCertificate
+          SslSupportMethod: sni-only
+        HttpVersion: http2
+        IPV6Enabled: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  AppBucketPolicyForCF:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AppBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${AppBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !GetAtt CloudFrontDistribution.Arn
+
+  ############################
+  # ALB + Target Group + Listeners
+  ############################
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets: [ !Ref PublicSubnet1, !Ref PublicSubnet2 ]
+      SecurityGroups: [ !Ref AlbSecurityGroup ]
+      LoadBalancerAttributes:
+        - Key: routing.http2.enabled
+          Value: 'true'
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref LogsBucket
+        - Key: access_logs.s3.prefix
+          Value: 'alb'
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckPath: !Ref AlbHealthCheckPath
+      Matcher: { HttpCode: '200-399' }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  ############################
+  # Launch Template + AutoScaling
+  ############################
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-lt'
+      LaunchTemplateData:
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        ImageId: !Ref LatestAL2023Ami
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds: [ !Ref AppSecurityGroup ]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true    # Uses AWS-managed EBS KMS key (alias/aws/ebs)
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf -y update
+            dnf -y install nginx amazon-cloudwatch-agent
+            systemctl enable --now nginx
+            echo "OK" > /usr/share/nginx/html/health
+            cat >/opt/aws/amazon-cloudwatch-agent/bin/config.json <<'JSON'
+            {
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      { "file_path": "/var/log/messages", "log_group_name": "${AppLogGroup}", "log_stream_name": "{instance_id}/messages", "timestamp_format": "%b %d %H:%M:%S" },
+                      { "file_path": "/var/log/nginx/access.log", "log_group_name": "${AppLogGroup}", "log_stream_name": "{instance_id}/nginx-access" },
+                      { "file_path": "/var/log/nginx/error.log", "log_group_name": "${AppLogGroup}", "log_stream_name": "{instance_id}/nginx-error" }
+                    ]
+                  }
+                }
+              }
+            }
+            JSON
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
+
+  LatestAL2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+  AppAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      DesiredCapacity: !Ref AsgDesiredCapacity
+      MinSize: !Ref AsgMinSize
+      MaxSize: !Ref AsgMaxSize
+      TargetGroupARNs: [ !Ref AppTargetGroup ]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      MetricsCollection:
+        - Granularity: '1Minute'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-app'
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref ProjectTagValue
+          PropagateAtLaunch: true
+
+  CpuScalePolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAsg
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50.0
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/app/${AWS::StackName}'
+      RetentionInDays: 90
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  ############################
+  # RDS (Multi-AZ, encrypted)
+  ############################
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for RDS
+      SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: !Ref DBEngine
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      MultiAZ: true
+      StorageEncrypted: true   # Uses AWS-managed KMS for RDS
+      PubliclyAccessible: false
+      VPCSecurityGroups: [ !Ref DbSecurityGroup ]
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      DeletionProtection: true
+      EnableCloudwatchLogsExports: !If
+        - IsPostgres
+        - [postgresql]
+        - !If [ IsMySQL, [error, general, slowquery], [] ]
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  ############################
+  # CloudTrail + CloudWatch
+  ############################
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloudtrail/${AWS::StackName}'
+      RetentionInDays: 90
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      IsLogging: true
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      S3BucketName: !Ref LogsBucket
+      S3KeyPrefix: cloudtrail
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  ############################
+  # Route 53 Hosted Zone + Failover DNS
+  ############################
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref HostedZoneName
+      HostedZoneTags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  # Health check against CloudFront
+  CFHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTP
+        FullyQualifiedDomainName: !GetAtt CloudFrontDistribution.DomainName
+        ResourcePath: !Ref CloudFrontHealthCheckPath
+        RequestInterval: 30
+        FailureThreshold: 3
+      HealthCheckTags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  # Secondary website bucket for DNS Failover (serves maintenance page). Public website hosting ON.
+  FailoverBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-failover-${AWS::AccountId}'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      AccessControl: PublicRead
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTagValue }
+
+  FailoverBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FailoverBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadForWebsite
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${FailoverBucket.Arn}/*'
+
+  # Primary CNAME -> CloudFront
+  AppPrimaryRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub '${AppSubdomain}.${HostedZoneName}'
+      Type: CNAME
+      SetIdentifier: Primary
+      Failover: PRIMARY
+      TTL: 60
+      ResourceRecords: [ !GetAtt CloudFrontDistribution.DomainName ]
+      HealthCheckId: !Ref CFHealthCheck
+
+  # Secondary CNAME -> S3 Website Endpoint
+  AppSecondaryRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub '${AppSubdomain}.${HostedZoneName}'
+      Type: CNAME
+      SetIdentifier: Secondary
+      Failover: SECONDARY
+      TTL: 60
+      ResourceRecords:
+        - !Sub '${FailoverBucket.RegionalDomainName}'
+
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}:VpcId'
+  PublicSubnetIds:
+    Value: !Join [ ',', [ !Ref PublicSubnet1, !Ref PublicSubnet2 ] ]
+  PrivateSubnetIds:
+    Value: !Join [ ',', [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ] ]
+  AlbDnsName:
+    Value: !GetAtt AppLoadBalancer.DNSName
+  TargetGroupArn:
+    Value: !Ref AppTargetGroup
+  AsgName:
+    Value: !Ref AppAsg
+  AppBucketName:
+    Value: !Ref AppBucket
+  LogsBucketName:
+    Value: !Ref LogsBucket
+  RdsEndpoint:
+    Value: !GetAtt DBInstance.Endpoint.Address
+  CloudFrontDomain:
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  HostedZoneId:
+    Value: !Ref HostedZone
+  VpcPeeringId:
+    Value: !Ref VpcPeering
