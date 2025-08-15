@@ -104,6 +104,7 @@ Resources:
       DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
   VPCFlowLogsRole:
     Type: AWS::IAM::Role
+    Description: Role for EC2 instance access to S3, CloudWatch, and KMS
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -336,6 +337,7 @@ Resources:
 
   AppRole:
     Type: AWS::IAM::Role
+    Description: Role for EC2 instance access to S3, CloudWatch, and KMS
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -396,7 +398,7 @@ Resources:
             Principal:
               AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
             Action: kms:*
-            Resource: "*"
+            Resource: !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/${AppKMSKey}"
           - Sid: AllowAppRoleUseOfKey
             Effect: Allow
             Principal:
@@ -407,7 +409,7 @@ Resources:
               - kms:ReEncrypt*
               - kms:GenerateDataKey*
               - kms:DescribeKey
-            Resource: "*"
+            Resource: !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/${AppKMSKey}"
           - Sid: AllowS3UseOfKeyForAppBucket
             Effect: Allow
             Principal:
@@ -418,7 +420,7 @@ Resources:
               - kms:ReEncrypt*
               - kms:GenerateDataKey*
               - kms:DescribeKey
-            Resource: "*"
+            Resource: !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/${AppKMSKey}"
             Condition:
               StringEquals:
                 kms:ViaService: !Sub "s3.${AWS::Region}.amazonaws.com"
@@ -465,9 +467,9 @@ Resources:
               Value: !Ref ProjectTagValue
         UserData:
           Fn::Base64: !Sub |
-            #!/bin/bash
-            yum -y update
-            yum -y install nginx amazon-cloudwatch-agent
+            #!/bin/bash -xe
+            yum -y update || echo "yum update failed" >> /var/log/userdata-error.log
+            yum -y install nginx amazon-cloudwatch-agent || echo "Install failed" >> /var/log/userdata-error.log
             systemctl enable --now nginx
             echo "App Started" > /usr/share/nginx/html/index.html
             cat >/opt/aws/amazon-cloudwatch-agent/bin/config.json <<'EOF'
@@ -534,6 +536,8 @@ Resources:
           Value: true
         - Key: access_logs.s3.bucket
           Value: !Ref S3AccessLogBucket
+        - Key: access_logs.s3.prefix
+          Value: alb/
 
 
   ALBTargetGroup:
@@ -600,6 +604,7 @@ Resources:
   
   DbMasterSecret:
     Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
     Properties:
       Name: app-db-master
       GenerateSecretString:
@@ -648,8 +653,20 @@ Resources:
         - Key: Project
           Value: !Ref ProjectTagValue
 
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Custom parameter group
+      Family: !If [IsPostgres, "postgres13", "mysql8.0"]
+      Parameters:
+        log_min_duration_statement: "1000"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+
   RDSMonitoringRole:
     Type: AWS::IAM::Role
+    Description: Role for EC2 instance access to S3, CloudWatch, and KMS
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -797,6 +814,11 @@ Resources:
           ViewerProtocolPolicy: redirect-to-https
           ForwardedValues:
             QueryString: false
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponsePagePath: /index.html
+            ResponseCode: 200
+            ErrorCachingMinTTL: 300  # <-- Added for improved SPA support
         ViewerCertificate:
           AcmCertificateArn: !Ref ACMCertificateArn
           SslSupportMethod: sni-only
@@ -804,10 +826,10 @@ Resources:
           Bucket: !GetAtt S3AccessLogBucket.DomainName
           IncludeCookies: false
           Prefix: cloudfront/
-    # <-- Tags must be here (top-level), not under DistributionConfig
-    Tags:
-      - Key: Project
-        Value: !Ref ProjectTagValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTagValue
+    
 
 
   CloudTrailS3Bucket:
@@ -980,11 +1002,13 @@ Outputs:
   ALBDNSName:
     Value: !GetAtt AppLoadBalancer.DNSName
     Description: ALB DNS Name
+    Export:
+      Name: !Sub "${AWS::StackName}-ALB-DNS"
   RDSAddress:
     Value: !GetAtt DBInstance.Endpoint.Address
     Description: RDS Endpoint
   CloudFrontURL:
-    Value: !GetAtt CloudFrontDistribution.DomainName
+    Value: '!Sub 'https://${CloudFrontDistribution.DomainName}''
     Description: CloudFront Distribution URL
   S3BucketName:
     Value: !Ref AppS3Bucket
